@@ -724,7 +724,7 @@ def render_results(
 # Header and API key ---------------------------------------------------------
 logo_path = Path("logo.png")
 if logo_path.exists():
-    st.image(str(logo_path), width=260)
+    st.image(str(logo_path), width=120)
 
 st.caption("Behavioral intervention simulation with Socrates Qwen2.5 14B SFT")
 st.title(APP_NAME)
