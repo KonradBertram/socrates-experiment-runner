@@ -47,6 +47,13 @@ MAX_SLOT_ATTEMPTS = 3
 MAX_RESPONSE_OPTIONS = 10
 OPTION_CODES = tuple(str(i) for i in range(1, 11))
 
+RESPONSE_STRUCTURE_CATEGORICAL = "Categorical / unordered"
+RESPONSE_STRUCTURE_ORDERED = "Ordered / Likert scale"
+RESPONSE_STRUCTURE_OPTIONS = (
+    RESPONSE_STRUCTURE_CATEGORICAL,
+    RESPONSE_STRUCTURE_ORDERED,
+)
+
 US_PRESET_NOTE = (
     "Approximate, rounded U.S. adult/household marginal distributions. "
     "Each demographic dimension is sampled independently, so the preset does "
@@ -157,6 +164,38 @@ DEFAULT_DEMOGRAPHIC_DIMENSIONS = tuple(DEMOGRAPHIC_DEFINITIONS.keys())
 
 class ConfigurationError(ValueError):
     """Raised when a run configuration is internally inconsistent."""
+
+
+def normalize_response_option_structure(value: Any) -> str:
+    """Return a validated response-option structure label.
+
+    Older saved configurations that predate this feature default to categorical
+    behavior. Any other unexpected value is rejected rather than silently
+    falling back to counterbalancing.
+    """
+    if value is None:
+        return RESPONSE_STRUCTURE_CATEGORICAL
+    structure = str(value)
+    if structure not in RESPONSE_STRUCTURE_OPTIONS:
+        raise ConfigurationError(
+            f"Unknown response option structure: {structure!r}. "
+            f"Expected one of {RESPONSE_STRUCTURE_OPTIONS}."
+        )
+    return structure
+
+
+def canonical_option_id_map(options: Sequence[str]) -> dict[str, str]:
+    """Map each answer-option text to a stable internal ID.
+
+    These IDs never depend on how response options are displayed or which
+    response code is assigned in a particular simulated respondent prompt.
+    """
+    option_list = [str(option) for option in options]
+    if len(option_list) < 2:
+        raise ConfigurationError("At least two response options are required.")
+    if len({option.casefold() for option in option_list}) != len(option_list):
+        raise ConfigurationError("Response options must be unique.")
+    return {option: f"OPT{index:02d}" for index, option in enumerate(option_list, start=1)}
 
 
 def api_headers(api_key: str) -> dict[str, str]:
@@ -379,12 +418,105 @@ def counterbalanced_option_orders(
     return orders[:count]
 
 
+def option_orders_for_structure(
+    options: Sequence[str],
+    count: int,
+    rng: random.Random,
+    response_option_structure: str | None,
+) -> list[list[str]]:
+    """Build the prompt-facing option order without changing canonical identity.
+
+    Ordered/Likert options always retain the exact order entered by the
+    researcher. Categorical options use the existing counterbalancing scheme.
+    In both cases, the canonical internal option IDs remain fixed.
+    """
+    structure = normalize_response_option_structure(response_option_structure)
+    option_list = list(options)
+    canonical_option_id_map(option_list)  # validates count and uniqueness
+
+    if count <= 0:
+        return []
+    if structure == RESPONSE_STRUCTURE_ORDERED:
+        return [list(option_list) for _ in range(count)]
+    return counterbalanced_option_orders(option_list, count, rng)
+
+
+def validate_plan_response_mappings(
+    config: Mapping[str, Any],
+    jobs: Sequence[Mapping[str, Any]],
+) -> None:
+    """Fail fast if any planned prompt could corrupt response interpretation.
+
+    The canonical mapping is fixed by the researcher-entered answer-option
+    order. A categorical prompt may map response codes to options differently,
+    but every job must still decode back to the same canonical option IDs.
+    Ordered/Likert jobs additionally must preserve the entered option order and
+    therefore use an identical code-to-option mapping in every prompt.
+    """
+    canonical_options = list(config["answer_options"])
+    option_to_id = canonical_option_id_map(canonical_options)
+    structure = normalize_response_option_structure(
+        config.get("response_option_structure")
+    )
+    expected_codes = list(OPTION_CODES[: len(canonical_options)])
+    expected_ordered_mapping = dict(zip(expected_codes, canonical_options))
+
+    for job in jobs:
+        option_order = list(job.get("option_order", []))
+        code_to_option = dict(job.get("code_to_option", {}))
+        job_option_to_id = dict(job.get("option_to_canonical_id", {}))
+        code_to_id = dict(job.get("code_to_canonical_id", {}))
+
+        if len(option_order) != len(canonical_options) or set(option_order) != set(canonical_options):
+            raise ConfigurationError(
+                f"Invalid option order in slot {job.get('slot_id')}: every prompt must contain "
+                "each canonical answer option exactly once."
+            )
+        if list(code_to_option.keys()) != expected_codes:
+            raise ConfigurationError(
+                f"Invalid response-code set in slot {job.get('slot_id')}."
+            )
+        if set(code_to_option.values()) != set(canonical_options):
+            raise ConfigurationError(
+                f"Invalid code-to-option mapping in slot {job.get('slot_id')}."
+            )
+        if job_option_to_id != option_to_id:
+            raise ConfigurationError(
+                f"Canonical option mapping changed in slot {job.get('slot_id')}."
+            )
+        expected_code_to_id = {
+            code: option_to_id[option]
+            for code, option in code_to_option.items()
+        }
+        if code_to_id != expected_code_to_id:
+            raise ConfigurationError(
+                f"Code-to-canonical mapping is inconsistent in slot {job.get('slot_id')}."
+            )
+
+        if structure == RESPONSE_STRUCTURE_ORDERED:
+            if option_order != canonical_options:
+                raise ConfigurationError(
+                    f"Ordered response options were reordered in slot {job.get('slot_id')}."
+                )
+            if code_to_option != expected_ordered_mapping:
+                raise ConfigurationError(
+                    f"Ordered response-code mapping changed in slot {job.get('slot_id')}."
+                )
+
+
 def build_user_prompt(
     config: Mapping[str, Any],
     variant: Mapping[str, Any],
     profile_values: Mapping[str, str],
     option_order: Sequence[str],
 ) -> tuple[str, dict[str, str]]:
+    canonical_options = list(config["answer_options"])
+    canonical_option_id_map(canonical_options)
+    if len(option_order) != len(canonical_options) or set(option_order) != set(canonical_options):
+        raise ConfigurationError(
+            "The prompt-facing option order must contain every canonical answer option exactly once."
+        )
+
     codes = OPTION_CODES[: len(option_order)]
     code_to_option = dict(zip(codes, option_order))
 
@@ -424,7 +556,8 @@ QUESTION
 RESPONSE OPTIONS
 {option_lines}
 
-Only return the integer corresponding to your answer from this list: {allowed_codes}. Return the integer only, nothing else."""
+The response codes are technical labels used only to record your answer.
+Only return the response code corresponding to your answer from this list: {allowed_codes}. Return the code only, nothing else."""
 
     return user_prompt, code_to_option
 
@@ -441,6 +574,12 @@ def build_simulation_plan(config: Mapping[str, Any], seed: int) -> list[dict[str
     slot_number = 1
     respondent_number = 1
 
+    canonical_options = list(config["answer_options"])
+    option_to_canonical_id = canonical_option_id_map(canonical_options)
+    response_option_structure = normalize_response_option_structure(
+        config.get("response_option_structure")
+    )
+
     for variant_index, variant in enumerate(config["variants"]):
         count = int(variant["count"])
         variant_rng = random.Random(rng.getrandbits(64))
@@ -452,17 +591,12 @@ def build_simulation_plan(config: Mapping[str, Any], seed: int) -> list[dict[str
             rng=variant_rng,
         )
 
-        if config.get("response_option_structure") == "Ordered / Likert scale":
-            option_orders = [
-                list(config["answer_options"])
-                for _ in range(count)
-            ]
-        else:
-            option_orders = counterbalanced_option_orders(
-                config["answer_options"],
-                count,
-                variant_rng,
-            )
+        option_orders = option_orders_for_structure(
+            canonical_options,
+            count,
+            variant_rng,
+            response_option_structure,
+        )
 
         paired = list(zip(profiles, option_orders))
         variant_rng.shuffle(paired)
@@ -474,6 +608,10 @@ def build_simulation_plan(config: Mapping[str, Any], seed: int) -> list[dict[str
                 profile_values=profile["values"],
                 option_order=option_order,
             )
+            code_to_canonical_id = {
+                code: option_to_canonical_id[option]
+                for code, option in code_to_option.items()
+            }
 
             jobs.append(
                 {
@@ -484,8 +622,12 @@ def build_simulation_plan(config: Mapping[str, Any], seed: int) -> list[dict[str
                     "variant_index": variant_index,
                     "profile_segments": profile["segments"],
                     "profile_values": profile["values"],
+                    "response_option_structure": response_option_structure,
+                    "canonical_option_order": list(canonical_options),
+                    "option_to_canonical_id": dict(option_to_canonical_id),
                     "option_order": list(option_order),
                     "code_to_option": code_to_option,
+                    "code_to_canonical_id": code_to_canonical_id,
                     "system_prompt": SYSTEM_PROMPT,
                     "user_prompt": user_prompt,
                 }
@@ -494,9 +636,9 @@ def build_simulation_plan(config: Mapping[str, Any], seed: int) -> list[dict[str
             slot_number += 1
             respondent_number += 1
 
+    validate_plan_response_mappings(config, jobs)
     rng.shuffle(jobs)
     return jobs
-
 
 def normalize_model_answer(
     raw_text: str,
@@ -504,9 +646,10 @@ def normalize_model_answer(
 ) -> tuple[str | None, str | None]:
     """Map a Socrates completion to one of the allowed response options.
 
-    Socrates was fine-tuned on direct survey prediction prompts whose answers are
-    commonly numeric labels. We therefore prefer exact numeric outputs, but also
-    tolerate a small set of harmless wrappers such as "Option 2" or
+    Socrates is instructed to return one of the prompt-facing response codes.
+    The code is decoded through the mapping stored on that exact respondent job,
+    so categorical counterbalancing never changes the canonical answer identity.
+    We also tolerate a small set of harmless wrappers such as "Option 2" or
     "The answer is 2" so formatting noise does not burn simulation slots.
     """
     text = (raw_text or "").strip()
@@ -517,10 +660,16 @@ def normalize_model_answer(
     first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
     cleaned = first_line.strip(" \t\r\n\"'`.,;:()[]{}")
 
+    def match_code(candidate: str) -> str | None:
+        for code in code_to_option:
+            if candidate.casefold() == str(code).casefold():
+                return str(code)
+        return None
+
     # Best case: the model follows the instruction exactly.
-    for code, option in code_to_option.items():
-        if cleaned.casefold() == str(code).casefold():
-            return str(code), option
+    matched_code = match_code(cleaned)
+    if matched_code is not None:
+        return matched_code, code_to_option[matched_code]
 
     # Also accept the exact option text if the model returns the label rather than
     # the requested code.
@@ -542,8 +691,9 @@ def normalize_model_answer(
         match = re.search(pattern, first_line, flags=re.IGNORECASE)
         if match:
             candidate = match.group(1)
-            if candidate in code_to_option:
-                return candidate, code_to_option[candidate]
+            matched_code = match_code(candidate)
+            if matched_code is not None:
+                return matched_code, code_to_option[matched_code]
 
     return None, None
 
@@ -621,6 +771,15 @@ def run_one(
             choice = payload["choices"][0]
             raw = extract_chat_content(choice)
             selected_code, selected_option = normalize_model_answer(raw, job["code_to_option"])
+            selected_option_id = (
+                job["option_to_canonical_id"].get(selected_option)
+                if selected_option is not None
+                else None
+            )
+            if selected_option is not None and selected_option_id is None:
+                raise ConfigurationError(
+                    "A decoded answer option was missing from the canonical option mapping."
+                )
 
             usage = payload.get("usage", {}) or {}
             prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
@@ -639,6 +798,7 @@ def run_one(
                 "raw_completion": raw,
                 "selected_code": selected_code,
                 "selected_option": selected_option,
+                "selected_option_id": selected_option_id,
                 "status": status,
                 "error": None,
                 "prompt_tokens": prompt_tokens,
@@ -678,6 +838,7 @@ def run_one(
         "raw_completion": "",
         "selected_code": None,
         "selected_option": None,
+        "selected_option_id": None,
         "status": "api_error",
         "error": last_error or "Unknown API error",
         "prompt_tokens": 0,
@@ -779,10 +940,51 @@ def estimate_run(
     }
 
 
+def _selected_canonical_id(
+    row: Mapping[str, Any],
+    option_to_id: Mapping[str, str],
+) -> str | None:
+    """Read and verify the stable internal answer identity.
+
+    New runs carry an explicit canonical ID. Older rows can still be interpreted
+    from selected_option, but any disagreement between the two representations
+    is treated as a hard configuration error instead of being silently counted.
+    """
+    valid_ids = set(option_to_id.values())
+    selected_option = row.get("selected_option")
+    selected_id = row.get("selected_option_id")
+
+    if selected_id is not None:
+        selected_id = str(selected_id)
+        if selected_id not in valid_ids:
+            raise ConfigurationError(
+                f"Unknown canonical option ID in result row: {selected_id!r}."
+            )
+        if selected_option is not None:
+            expected_id = option_to_id.get(selected_option)
+            if expected_id != selected_id:
+                raise ConfigurationError(
+                    "Result row contains inconsistent selected_option and "
+                    "selected_option_id values."
+                )
+        return selected_id
+
+    if selected_option is None:
+        return None
+    fallback_id = option_to_id.get(selected_option)
+    if fallback_id is None:
+        raise ConfigurationError(
+            f"Unknown selected answer option in result row: {selected_option!r}."
+        )
+    return fallback_id
+
+
 def overall_result_rows(config: Mapping[str, Any], accepted_rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     target = config["target_behavior"]
     control = config["control_variant"]
     options = list(config["answer_options"])
+    option_to_id = canonical_option_id_map(options)
+    target_id = option_to_id[target]
 
     by_variant: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
     for row in accepted_rows:
@@ -790,7 +992,10 @@ def overall_result_rows(config: Mapping[str, Any], accepted_rows: Sequence[Mappi
 
     control_rows = by_variant.get(control, [])
     control_n = len(control_rows)
-    control_target_count = sum(row.get("selected_option") == target for row in control_rows)
+    control_target_count = sum(
+        _selected_canonical_id(row, option_to_id) == target_id
+        for row in control_rows
+    )
     control_rate = control_target_count / control_n * 100 if control_n else None
 
     output: list[dict[str, Any]] = []
@@ -798,8 +1003,8 @@ def overall_result_rows(config: Mapping[str, Any], accepted_rows: Sequence[Mappi
         name = variant["name"]
         rows = by_variant.get(name, [])
         valid_n = len(rows)
-        counts = Counter(row.get("selected_option") for row in rows)
-        target_count = counts.get(target, 0)
+        counts = Counter(_selected_canonical_id(row, option_to_id) for row in rows)
+        target_count = counts.get(target_id, 0)
         target_rate = target_count / valid_n * 100 if valid_n else None
         effect = None
         if target_rate is not None and control_rate is not None:
@@ -811,23 +1016,25 @@ def overall_result_rows(config: Mapping[str, Any], accepted_rows: Sequence[Mappi
             "Valid N": valid_n,
             "Target N": int(variant["count"]),
             "Target behavior": target,
+            "Target option ID": target_id,
             "Target count": target_count,
             "Target rate (%)": target_rate,
             "Effect vs control (pp)": effect,
         }
         for option in options:
-            option_count = counts.get(option, 0)
+            option_count = counts.get(option_to_id[option], 0)
             result[f"{option} count"] = option_count
             result[f"{option} rate (%)"] = option_count / valid_n * 100 if valid_n else None
         output.append(result)
     return output
-
 
 def segment_result_rows(config: Mapping[str, Any], accepted_rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     target = config["target_behavior"]
     control = config["control_variant"]
     variants = [variant["name"] for variant in config["variants"]]
     options = list(config["answer_options"])
+    option_to_id = canonical_option_id_map(options)
+    target_id = option_to_id[target]
     output: list[dict[str, Any]] = []
 
     for dimension in config["demographic_dimensions"]:
@@ -840,14 +1047,17 @@ def segment_result_rows(config: Mapping[str, Any], accepted_rows: Sequence[Mappi
             ]
             control_rows = [row for row in segment_rows if row["variant"] == control]
             control_n = len(control_rows)
-            control_target_count = sum(row.get("selected_option") == target for row in control_rows)
+            control_target_count = sum(
+                _selected_canonical_id(row, option_to_id) == target_id
+                for row in control_rows
+            )
             control_rate = control_target_count / control_n * 100 if control_n else None
 
             for variant in variants:
                 rows = [row for row in segment_rows if row["variant"] == variant]
                 valid_n = len(rows)
-                counts = Counter(row.get("selected_option") for row in rows)
-                target_count = counts.get(target, 0)
+                counts = Counter(_selected_canonical_id(row, option_to_id) for row in rows)
+                target_count = counts.get(target_id, 0)
                 target_rate = target_count / valid_n * 100 if valid_n else None
                 effect = None
                 if target_rate is not None and control_rate is not None:
@@ -859,17 +1069,18 @@ def segment_result_rows(config: Mapping[str, Any], accepted_rows: Sequence[Mappi
                     "Variant": variant,
                     "Control": variant == control,
                     "Valid N": valid_n,
+                    "Target behavior": target,
+                    "Target option ID": target_id,
                     "Target count": target_count,
                     "Target rate (%)": target_rate,
                     "Effect vs control (pp)": effect,
                 }
                 for option in options:
-                    count = counts.get(option, 0)
+                    count = counts.get(option_to_id[option], 0)
                     result[f"{option} count"] = count
                     result[f"{option} rate (%)"] = count / valid_n * 100 if valid_n else None
                 output.append(result)
     return output
-
 
 def profile_balance_rows(
     config: Mapping[str, Any],
@@ -1022,7 +1233,26 @@ def create_excel_export(
     row = key_value("Max slot attempts", MAX_SLOT_ATTEMPTS, row)
     row = key_value("Variant assignment", "Exact requested allocation; jobs randomly interleaved", row)
     row = key_value("Demographic balancing", "Marginal quotas reproduced separately within each variant", row)
-    row = key_value("Response-order control", "Cyclic Latin counterbalancing of option-to-code mappings", row)
+    response_structure = normalize_response_option_structure(
+        config.get("response_option_structure")
+    )
+    if response_structure == RESPONSE_STRUCTURE_ORDERED:
+        response_order_note = (
+            "Ordered/Likert: entered option order and code-to-option mapping are fixed "
+            "for every simulated respondent."
+        )
+    else:
+        response_order_note = (
+            "Categorical: prompt-facing code-to-option mappings are cyclically "
+            "counterbalanced; every response is decoded to a fixed canonical option ID "
+            "before analysis."
+        )
+    row = key_value("Response-order control", response_order_note, row)
+    row = key_value(
+        "Canonical option IDs",
+        canonical_option_id_map(config["answer_options"]),
+        row,
+    )
     row += 1
 
     row = section("Variants", row)
@@ -1103,10 +1333,14 @@ def create_excel_export(
             "Status": result.get("status"),
             "Selected code": result.get("selected_code"),
             "Selected option": result.get("selected_option"),
+            "Selected canonical option ID": result.get("selected_option_id"),
             "Raw completion": result.get("raw_completion"),
             "Error": result.get("error"),
-            "Option order": result.get("option_order"),
+            "Canonical option order": result.get("canonical_option_order"),
+            "Option-to-canonical-ID mapping": result.get("option_to_canonical_id"),
+            "Prompt option order": result.get("option_order"),
             "Code-to-option mapping": result.get("code_to_option"),
+            "Code-to-canonical-ID mapping": result.get("code_to_canonical_id"),
             "Prompt tokens": result.get("prompt_tokens"),
             "Completion tokens": result.get("completion_tokens"),
             "Cost": result.get("cost"),

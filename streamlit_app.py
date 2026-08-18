@@ -30,19 +30,22 @@ from socrates_core import (
     MAX_SLOT_ATTEMPTS,
     MODEL_ID,
     OPTION_CODES,
+    RESPONSE_STRUCTURE_CATEGORICAL,
+    RESPONSE_STRUCTURE_ORDERED,
+    RESPONSE_STRUCTURE_OPTIONS,
     SYSTEM_PROMPT,
     US_PRESET_NOTE,
     US_PRESET_SOURCES,
     build_simulation_plan,
     build_user_prompt,
     config_fingerprint,
-    counterbalanced_option_orders,
     create_excel_export,
     distributions_from_preset,
     estimate_run,
     generate_profiles,
     get_runtime_info,
     largest_remainder_counts,
+    option_orders_for_structure,
     overall_result_rows,
     parse_answer_options,
     profile_balance_rows,
@@ -241,6 +244,7 @@ def validate_inputs(
     allocation_counts: Sequence[int],
     outcome_question: str,
     answer_options: Sequence[str],
+    response_option_structure: str,
     target_behavior: str | None,
     demographic_dimensions: Sequence[str],
     demographic_errors: Sequence[str],
@@ -278,6 +282,9 @@ def validate_inputs(
 
     if not outcome_question.strip():
         errors.append("Add the question asked after the customer sees the variant.")
+
+    if response_option_structure not in RESPONSE_STRUCTURE_OPTIONS:
+        errors.append("Select a valid response option structure.")
 
     if len(answer_options) < 2:
         errors.append("Add at least two answer options, one per line.")
@@ -448,6 +455,7 @@ def execute_experiment(
                         "raw_completion": "",
                         "selected_code": None,
                         "selected_option": None,
+                        "selected_option_id": None,
                         "status": "api_error",
                         "error": str(exc),
                         "prompt_tokens": 0,
@@ -722,6 +730,7 @@ def render_results(
             if config["settings"]["use_top_k"]
             else "Top-k: **disabled / provider default**"
         )
+        st.write(f"Response option structure: `{config['response_option_structure']}`")
         st.write(f"Maximum generated tokens per response: `{MAX_NEW_TOKENS}`")
         st.write(f"Maximum attempts per respondent slot: `{MAX_SLOT_ATTEMPTS}`")
 
@@ -887,15 +896,14 @@ outcome_question = st.text_area(
 
 response_option_structure = st.radio(
     "Response option structure",
-    options=[
-        "Categorical / unordered",
-        "Ordered / Likert scale",
-    ],
+    options=list(RESPONSE_STRUCTURE_OPTIONS),
     index=0,
     horizontal=True,
     help=(
-        "Categorical options are counterbalanced across response-code positions. "
-        "Ordered / Likert options always remain in the order entered below."
+        "Categorical options may be counterbalanced across prompt-facing response codes, "
+        "but every answer keeps a fixed canonical internal identity for analysis. "
+        "Ordered / Likert options always remain in the exact order entered below and "
+        "use the same code-to-option mapping in every respondent prompt."
     ),
 )
 
@@ -903,11 +911,12 @@ answer_options_text = st.text_area(
     "Answer options — one option per line",
     value="Follow the call to action now\nFollow the call to action later\nContact the insurer\nCompare alternatives\nCancel the policy\nTake no action",
     height=170,
-help=(
-    "Enter one response option per line and do not add A/B/C labels. "
-    "For categorical options, the app counterbalances their response-code positions. "
-    "For ordered / Likert scales, the entered order is preserved in every prompt."
-),
+    help=(
+        "Enter one response option per line and do not add response-code labels. "
+        "The entered list defines the fixed canonical answer identities used in analysis. "
+        "Categorical mode may vary the prompt-facing code assignment; ordered / Likert "
+        "mode preserves this exact order and mapping in every prompt."
+    ),
 )
 answer_options = parse_answer_options(answer_options_text)
 
@@ -1008,6 +1017,7 @@ errors = validate_inputs(
     allocation_counts=allocation_counts,
     outcome_question=outcome_question,
     answer_options=answer_options,
+    response_option_structure=response_option_structure,
     target_behavior=target_behavior if target_behavior in answer_options else None,
     demographic_dimensions=selected_dimensions,
     demographic_errors=demographic_errors,
@@ -1060,19 +1070,12 @@ with st.expander("Preview Socrates prompt template"):
             current_config["variants"],
         ):
             with tab:
-                if (
-                    current_config["response_option_structure"]
-                    == "Ordered / Likert scale"
-                ):
-                    preview_option_order = list(
-                        current_config["answer_options"]
-                    )
-                else:
-                    preview_option_order = counterbalanced_option_orders(
-                        current_config["answer_options"],
-                        1,
-                        preview_rng,
-                    )[0]
+                preview_option_order = option_orders_for_structure(
+                    current_config["answer_options"],
+                    1,
+                    preview_rng,
+                    current_config["response_option_structure"],
+                )[0]
 
                 user_prompt, mapping = build_user_prompt(
                     current_config,
@@ -1089,18 +1092,19 @@ with st.expander("Preview Socrates prompt template"):
 
                 if (
                     current_config["response_option_structure"]
-                    == "Ordered / Likert scale"
+                    == RESPONSE_STRUCTURE_ORDERED
                 ):
                     st.caption(
-                        "The paid run uses this exact message structure. "
-                        "Respondent profiles vary, but the ordered response "
-                        "scale remains in the entered order for every query."
+                        "Ordered mode: the paid run preserves this exact answer order and "
+                        "the same response-code mapping for every respondent. Internal "
+                        "canonical answer identities are also fixed."
                     )
                 else:
                     st.caption(
-                        "The paid run uses this exact message structure, "
-                        "but each query has an individually generated profile "
-                        "and a counterbalanced answer-code mapping."
+                        "Categorical mode: prompt-facing response-code assignments may vary "
+                        "by respondent for counterbalancing. Each returned code is decoded "
+                        "through that respondent's stored mapping to a fixed canonical answer "
+                        "identity before any result is calculated."
                     )
 
     else:
@@ -1221,6 +1225,16 @@ if prepared and current_fingerprint == prepared["fingerprint"]:
         st.dataframe(estimate_df, hide_index=True, use_container_width=True)
 
     with st.expander("Preview exact planned prompts", expanded=True):
+        if prepared_config["response_option_structure"] == RESPONSE_STRUCTURE_ORDERED:
+            st.success(
+                "Ordered mapping integrity check passed: every planned respondent uses the "
+                "entered answer order and the identical code-to-option mapping."
+            )
+        else:
+            st.info(
+                "Categorical mode: prompt-facing code assignments are counterbalanced by design. "
+                "The canonical option ID shown below is fixed and is what the results logic uses."
+            )
         st.caption(
             "The examples below are actual respondent slots from this prepared run. The "
             "same plan, profiles, assignments and answer mappings will be used when you click Run."
@@ -1242,7 +1256,11 @@ if prepared and current_fingerprint == prepared["fingerprint"]:
                 st.dataframe(profile_df, hide_index=True, use_container_width=True)
                 mapping_df = pd.DataFrame(
                     [
-                        {"Code": code, "Answer option": option}
+                        {
+                            "Prompt response code": code,
+                            "Canonical option ID": example_job["code_to_canonical_id"][code],
+                            "Answer option": option,
+                        }
                         for code, option in example_job["code_to_option"].items()
                     ]
                 )
