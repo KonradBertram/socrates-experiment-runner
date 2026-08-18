@@ -444,20 +444,29 @@ def build_simulation_plan(config: Mapping[str, Any], seed: int) -> list[dict[str
     for variant_index, variant in enumerate(config["variants"]):
         count = int(variant["count"])
         variant_rng = random.Random(rng.getrandbits(64))
+
         profiles = generate_profiles(
             count=count,
             dimensions=config["demographic_dimensions"],
             distributions=config["demographic_distributions"],
             rng=variant_rng,
         )
-        option_orders = counterbalanced_option_orders(
-            config["answer_options"],
-            count,
-            variant_rng,
-        )
+
+        if config.get("response_option_structure") == "Ordered / Likert scale":
+            option_orders = [
+                list(config["answer_options"])
+                for _ in range(count)
+            ]
+        else:
+            option_orders = counterbalanced_option_orders(
+                config["answer_options"],
+                count,
+                variant_rng,
+            )
 
         paired = list(zip(profiles, option_orders))
         variant_rng.shuffle(paired)
+
         for profile, option_order in paired:
             user_prompt, code_to_option = build_user_prompt(
                 config=config,
@@ -465,6 +474,7 @@ def build_simulation_plan(config: Mapping[str, Any], seed: int) -> list[dict[str
                 profile_values=profile["values"],
                 option_order=option_order,
             )
+
             jobs.append(
                 {
                     "slot_id": f"S{slot_number:05d}",
@@ -480,6 +490,7 @@ def build_simulation_plan(config: Mapping[str, Any], seed: int) -> list[dict[str
                     "user_prompt": user_prompt,
                 }
             )
+
             slot_number += 1
             respondent_number += 1
 
@@ -995,6 +1006,11 @@ def create_excel_export(
     row = section("Outcome", row)
     row = key_value("Outcome question", config["outcome_question"], row)
     row = key_value("Answer options", "\n".join(config["answer_options"]), row)
+    row = key_value(
+        "Response option structure",
+        config.get("response_option_structure", "Categorical / unordered"),
+        row,
+    )
     row = key_value("Target behavior", config["target_behavior"], row)
     row += 1
 

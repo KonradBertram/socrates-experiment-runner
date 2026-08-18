@@ -36,6 +36,7 @@ from socrates_core import (
     build_simulation_plan,
     build_user_prompt,
     config_fingerprint,
+    counterbalanced_option_orders,
     create_excel_export,
     distributions_from_preset,
     estimate_run,
@@ -304,6 +305,7 @@ def build_config(
     allocation_counts: Sequence[int],
     outcome_question: str,
     answer_options: Sequence[str],
+    response_option_structure: str,
     target_behavior: str,
     total_simulations: int,
     control_variant: str,
@@ -331,6 +333,7 @@ def build_config(
         "variants": built_variants,
         "outcome_question": outcome_question.strip(),
         "answer_options": list(answer_options),
+        "response_option_structure": response_option_structure,
         "target_behavior": target_behavior,
         "total_simulations": int(total_simulations),
         "control_variant": control_variant,
@@ -881,14 +884,30 @@ outcome_question = st.text_area(
     placeholder="e.g. What would you be most likely to do next?",
     height=100,
 )
+
+response_option_structure = st.radio(
+    "Response option structure",
+    options=[
+        "Categorical / unordered",
+        "Ordered / Likert scale",
+    ],
+    index=0,
+    horizontal=True,
+    help=(
+        "Categorical options are counterbalanced across response-code positions. "
+        "Ordered / Likert options always remain in the order entered below."
+    ),
+)
+
 answer_options_text = st.text_area(
     "Answer options — one option per line",
     value="Follow the call to action now\nFollow the call to action later\nContact the insurer\nCompare alternatives\nCancel the policy\nTake no action",
     height=170,
-    help=(
-        "Do not add A/B/C labels. The app assigns and counterbalances neutral response "
-        "codes automatically for every simulated respondent."
-    ),
+help=(
+    "Enter one response option per line and do not add A/B/C labels. "
+    "For categorical options, the app counterbalances their response-code positions. "
+    "For ordered / Likert scales, the entered order is preserved in every prompt."
+),
 )
 answer_options = parse_answer_options(answer_options_text)
 
@@ -1008,6 +1027,7 @@ if not errors:
         allocation_counts=allocation_counts,
         outcome_question=outcome_question,
         answer_options=answer_options,
+        response_option_structure=response_option_structure,
         target_behavior=target_behavior,
         total_simulations=total_simulations,
         control_variant=control_variant,
@@ -1023,33 +1043,70 @@ if not errors:
 with st.expander("Preview Socrates prompt template"):
     if current_config:
         preview_rng = random.Random(20260817)
+
         preview_profile = generate_profiles(
             1,
             current_config["demographic_dimensions"],
             current_config["demographic_distributions"],
             preview_rng,
         )[0]
-        preview_tabs = st.tabs([variant["name"] for variant in current_config["variants"]])
-        for tab, variant in zip(preview_tabs, current_config["variants"]):
+
+        preview_tabs = st.tabs(
+            [variant["name"] for variant in current_config["variants"]]
+        )
+
+        for tab, variant in zip(
+            preview_tabs,
+            current_config["variants"],
+        ):
             with tab:
+                if (
+                    current_config["response_option_structure"]
+                    == "Ordered / Likert scale"
+                ):
+                    preview_option_order = list(
+                        current_config["answer_options"]
+                    )
+                else:
+                    preview_option_order = counterbalanced_option_orders(
+                        current_config["answer_options"],
+                        1,
+                        preview_rng,
+                    )[0]
+
                 user_prompt, mapping = build_user_prompt(
                     current_config,
                     variant,
                     preview_profile["values"],
-                    current_config["answer_options"],
+                    preview_option_order,
                 )
+
                 st.markdown("**System message**")
                 st.code(SYSTEM_PROMPT, language=None)
+
                 st.markdown("**Example user message**")
                 st.code(user_prompt, language=None)
-                st.caption(
-                    "The paid run uses this exact message structure, but each query has an "
-                    "individually generated profile and a counterbalanced answer-code mapping."
-                )
+
+                if (
+                    current_config["response_option_structure"]
+                    == "Ordered / Likert scale"
+                ):
+                    st.caption(
+                        "The paid run uses this exact message structure. "
+                        "Respondent profiles vary, but the ordered response "
+                        "scale remains in the entered order for every query."
+                    )
+                else:
+                    st.caption(
+                        "The paid run uses this exact message structure, "
+                        "but each query has an individually generated profile "
+                        "and a counterbalanced answer-code mapping."
+                    )
+
     else:
-        st.caption("Complete the required fields to preview the prompt template.")
-
-
+        st.caption(
+            "Complete the required fields to preview the prompt template."
+        )
 # Review and cost estimate --------------------------------------------------
 review_clicked = st.button(
     "Review experiment, prompts & estimate cost",
