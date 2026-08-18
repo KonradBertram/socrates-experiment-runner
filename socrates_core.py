@@ -45,7 +45,7 @@ MAX_APP_WORKERS = 16
 MAX_SIMULATIONS = 1_000
 MAX_SLOT_ATTEMPTS = 3
 MAX_RESPONSE_OPTIONS = 10
-OPTION_CODES = tuple("ABCDEFGHIJ")
+OPTION_CODES = tuple(str(i) for i in range(1, 11))
 
 US_PRESET_NOTE = (
     "Approximate, rounded U.S. adult/household marginal distributions. "
@@ -424,7 +424,7 @@ QUESTION
 RESPONSE OPTIONS
 {option_lines}
 
-Only return one response code from this list: {allowed_codes}. Return the code only, with no explanation or additional text."""
+Only return the integer corresponding to your answer from this list: {allowed_codes}. Return the integer only, nothing else."""
 
     return user_prompt, code_to_option
 
@@ -491,30 +491,76 @@ def normalize_model_answer(
     raw_text: str,
     code_to_option: Mapping[str, str],
 ) -> tuple[str | None, str | None]:
+    """Map a Socrates completion to one of the allowed response options.
+
+    Socrates was fine-tuned on direct survey prediction prompts whose answers are
+    commonly numeric labels. We therefore prefer exact numeric outputs, but also
+    tolerate a small set of harmless wrappers such as "Option 2" or
+    "The answer is 2" so formatting noise does not burn simulation slots.
+    """
     text = (raw_text or "").strip()
     if not text:
         return None, None
 
-    # Remove common Markdown wrappers without trying to interpret explanations.
     text = text.replace("```", "").strip()
     first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
     cleaned = first_line.strip(" \t\r\n\"'`.,;:()[]{}")
 
+    # Best case: the model follows the instruction exactly.
     for code, option in code_to_option.items():
-        if cleaned.casefold() == code.casefold():
-            return code, option
+        if cleaned.casefold() == str(code).casefold():
+            return str(code), option
 
-    match = re.match(r"^\s*(?:option\s+)?([A-Za-z])(?:\b|[\).,:;-])", first_line, flags=re.IGNORECASE)
-    if match:
-        candidate = match.group(1).upper()
-        if candidate in code_to_option:
-            return candidate, code_to_option[candidate]
-
+    # Also accept the exact option text if the model returns the label rather than
+    # the requested code.
     for code, option in code_to_option.items():
         if cleaned.casefold() == option.strip().casefold():
-            return code, option
+            return str(code), option
+
+    allowed = sorted((str(code) for code in code_to_option), key=len, reverse=True)
+    escaped = "|".join(re.escape(code) for code in allowed)
+
+    # Common wrappers produced by instruction-tuned chat models.
+    wrapper_patterns = [
+        rf"^\s*(?:option|choice|response|answer)\s*[:=#-]?\s*({escaped})(?:\b|$)",
+        rf"^\s*(?:i\s+(?:would\s+)?(?:choose|select|pick))\s*[:=#-]?\s*(?:option\s*)?({escaped})(?:\b|$)",
+        rf"^\s*(?:the\s+)?(?:answer|choice|response)\s+(?:is|would\s+be)\s*[:=#-]?\s*({escaped})(?:\b|$)",
+        rf"^\s*({escaped})\s*[\).,:;-]",
+    ]
+    for pattern in wrapper_patterns:
+        match = re.search(pattern, first_line, flags=re.IGNORECASE)
+        if match:
+            candidate = match.group(1)
+            if candidate in code_to_option:
+                return candidate, code_to_option[candidate]
 
     return None, None
+
+
+def extract_chat_content(choice: Mapping[str, Any]) -> str:
+    """Extract text robustly from OpenAI-compatible chat completion shapes."""
+    message = choice.get("message") or {}
+    content = message.get("content") if isinstance(message, Mapping) else None
+
+    if isinstance(content, str):
+        return content
+
+    # Some OpenAI-compatible providers may return a list of content parts.
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, Mapping):
+                value = part.get("text") or part.get("content")
+                if isinstance(value, str):
+                    parts.append(value)
+        if parts:
+            return "".join(parts)
+
+    # Defensive fallback for providers exposing completion text directly.
+    direct_text = choice.get("text")
+    return direct_text if isinstance(direct_text, str) else ""
 
 
 def run_one(
@@ -562,7 +608,7 @@ def run_one(
             response.raise_for_status()
             payload = response.json()
             choice = payload["choices"][0]
-            raw = choice.get("message", {}).get("content", "")
+            raw = extract_chat_content(choice)
             selected_code, selected_option = normalize_model_answer(raw, job["code_to_option"])
 
             usage = payload.get("usage", {}) or {}

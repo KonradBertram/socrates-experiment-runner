@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import random
 import re
@@ -684,6 +685,27 @@ def render_results(
         help="Valid responses plus invalid and API-failed slot attempts.",
     )
 
+    invalid_rows = [
+        row for row in run_data.get("rows", []) if row.get("status") == "invalid_output"
+    ]
+    if invalid_rows:
+        with st.expander("Inspect invalid model outputs"):
+            diagnostic_rows = []
+            for row in invalid_rows[:25]:
+                diagnostic_rows.append(
+                    {
+                        "Attempt": row.get("attempt_id"),
+                        "Variant": row.get("variant"),
+                        "Raw completion": row.get("raw_completion", ""),
+                        "Finish reason": row.get("finish_reason"),
+                    }
+                )
+            st.dataframe(pd.DataFrame(diagnostic_rows), hide_index=True, use_container_width=True)
+            st.caption(
+                "These are the first invalid completions returned by Featherless. "
+                "They are shown for debugging only and are never counted as valid responses."
+            )
+
     with st.expander("Technical run details"):
         st.write(f"Model: `{MODEL_ID}`")
         st.write(f"Run timestamp: `{run_data['run_timestamp']}`")
@@ -724,7 +746,7 @@ def render_results(
 # Header and API key ---------------------------------------------------------
 logo_path = Path("logo.png")
 if logo_path.exists():
-    st.image(str(logo_path), width=120)
+    st.image(str(logo_path), width=260)
 
 st.caption("Behavioral intervention simulation with Socrates Qwen2.5 14B SFT")
 st.title(APP_NAME)
@@ -869,12 +891,52 @@ answer_options_text = st.text_area(
     ),
 )
 answer_options = parse_answer_options(answer_options_text)
-target_behavior = st.selectbox(
-    "Target behavior",
-    options=answer_options if answer_options else ["Add answer options above"],
-    index=0,
-    help="Choose the answer option whose rate and effect versus control should be highlighted.",
-)
+
+# The target-behavior selector must always reflect the CURRENT answer options.
+# Streamlit can preserve widget state across reruns, so a fixed selectbox key can
+# otherwise leave an old value visible after the answer-option list is edited.
+# We therefore give the widget a key derived from the current option list while
+# separately remembering the researcher's last valid selection.
+if answer_options:
+    options_signature = hashlib.sha256(
+        "\n".join(answer_options).encode("utf-8")
+    ).hexdigest()[:12]
+    target_widget_key = f"target_behavior::{options_signature}"
+
+    previous_widget_key = st.session_state.get("_target_behavior_widget_key")
+    if previous_widget_key and previous_widget_key != target_widget_key:
+        st.session_state.pop(previous_widget_key, None)
+    st.session_state["_target_behavior_widget_key"] = target_widget_key
+
+    previous_target = st.session_state.get("_target_behavior_value")
+    target_index = (
+        answer_options.index(previous_target)
+        if previous_target in answer_options
+        else 0
+    )
+
+    target_behavior = st.selectbox(
+        "Target behavior",
+        options=answer_options,
+        index=target_index,
+        key=target_widget_key,
+        help=(
+            "Choose the current answer option whose rate and effect versus control "
+            "should be highlighted. This list updates automatically when you edit "
+            "the answer options above."
+        ),
+    )
+    st.session_state["_target_behavior_value"] = target_behavior
+else:
+    target_behavior = None
+    st.selectbox(
+        "Target behavior",
+        options=["Add answer options above"],
+        index=0,
+        disabled=True,
+        key="target_behavior_empty",
+        help="Add at least two answer options above before selecting a target behavior.",
+    )
 
 settings = render_advanced_settings()
 
