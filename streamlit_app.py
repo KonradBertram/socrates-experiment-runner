@@ -810,7 +810,7 @@ st.header("2. Intervention variants")
 variant_setup_left, variant_setup_right = st.columns(2)
 with variant_setup_left:
     number_variants = int(
-        st.selectbox("Number of variants", [2, 3, 4, 5], index=0)
+        st.selectbox("Number of variants", [1, 2, 3, 4, 5], index=1)
     )
 with variant_setup_right:
     total_simulations = int(

@@ -1007,7 +1007,7 @@ def overall_result_rows(config: Mapping[str, Any], accepted_rows: Sequence[Mappi
         target_count = counts.get(target_id, 0)
         target_rate = target_count / valid_n * 100 if valid_n else None
         effect = None
-        if target_rate is not None and control_rate is not None:
+        if len(config["variants"]) > 1 and target_rate is not None and control_rate is not None:
             effect = target_rate - control_rate
 
         result: dict[str, Any] = {
@@ -1060,7 +1060,7 @@ def segment_result_rows(config: Mapping[str, Any], accepted_rows: Sequence[Mappi
                 target_count = counts.get(target_id, 0)
                 target_rate = target_count / valid_n * 100 if valid_n else None
                 effect = None
-                if target_rate is not None and control_rate is not None:
+                if len(config["variants"]) > 1 and target_rate is not None and control_rate is not None:
                     effect = target_rate - control_rate
 
                 result: dict[str, Any] = {
