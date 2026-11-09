@@ -1,27 +1,26 @@
-"""Core logic for the Socrates Experiment Runner.
+"""Socrates model inference, respondent planning, analysis, and Excel export.
 
-The functions in this module are deliberately independent from Streamlit so they
-can be unit-tested and reused by the UI layer.
+The model's repeated answers are synthetic predictions, not human observations.
+All question variants use a single shared demographic sample per experiment.
 """
-
 from __future__ import annotations
-
 import hashlib
 import io
 import json
 import math
 import random
 import re
+import statistics
 import time
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping, Sequence
 from urllib.parse import quote
-
 import requests
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+
 
 
 APP_NAME = "Socrates Experiment Runner"
@@ -162,6 +161,9 @@ DEMOGRAPHIC_DEFINITIONS: dict[str, dict[str, Any]] = {
 DEFAULT_DEMOGRAPHIC_DIMENSIONS = tuple(DEMOGRAPHIC_DEFINITIONS.keys())
 
 
+
+
+
 class ConfigurationError(ValueError):
     """Raised when a run configuration is internally inconsistent."""
 
@@ -209,28 +211,6 @@ def api_headers(api_key: str) -> dict[str, str]:
 def config_fingerprint(config: Mapping[str, Any]) -> str:
     payload = json.dumps(config, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
-def heuristic_token_count(text: str) -> int:
-    # A conservative, model-agnostic fallback for English text.
-    return max(1, math.ceil(len(text or "") / 3.7))
-
-
-def tokenize_count(api_key: str, text: str) -> int:
-    response = requests.post(
-        f"{API_BASE}/tokenize",
-        headers=api_headers(api_key),
-        json={"model": MODEL_ID, "text": text},
-        timeout=30,
-    )
-    response.raise_for_status()
-    tokens = response.json().get("tokens")
-    if not isinstance(tokens, list):
-        raise ValueError("Tokenizer response did not contain a token list.")
-    count = len(tokens)
-    if text.strip() and count <= 0:
-        raise ValueError("Tokenizer returned zero tokens for non-empty text.")
-    return max(1, count)
 
 
 def get_model_and_plan(api_key: str) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -440,205 +420,6 @@ def option_orders_for_structure(
         return [list(option_list) for _ in range(count)]
     return counterbalanced_option_orders(option_list, count, rng)
 
-
-def validate_plan_response_mappings(
-    config: Mapping[str, Any],
-    jobs: Sequence[Mapping[str, Any]],
-) -> None:
-    """Fail fast if any planned prompt could corrupt response interpretation.
-
-    The canonical mapping is fixed by the researcher-entered answer-option
-    order. A categorical prompt may map response codes to options differently,
-    but every job must still decode back to the same canonical option IDs.
-    Ordered/Likert jobs additionally must preserve the entered option order and
-    therefore use an identical code-to-option mapping in every prompt.
-    """
-    canonical_options = list(config["answer_options"])
-    option_to_id = canonical_option_id_map(canonical_options)
-    structure = normalize_response_option_structure(
-        config.get("response_option_structure")
-    )
-    expected_codes = list(OPTION_CODES[: len(canonical_options)])
-    expected_ordered_mapping = dict(zip(expected_codes, canonical_options))
-
-    for job in jobs:
-        option_order = list(job.get("option_order", []))
-        code_to_option = dict(job.get("code_to_option", {}))
-        job_option_to_id = dict(job.get("option_to_canonical_id", {}))
-        code_to_id = dict(job.get("code_to_canonical_id", {}))
-
-        if len(option_order) != len(canonical_options) or set(option_order) != set(canonical_options):
-            raise ConfigurationError(
-                f"Invalid option order in slot {job.get('slot_id')}: every prompt must contain "
-                "each canonical answer option exactly once."
-            )
-        if list(code_to_option.keys()) != expected_codes:
-            raise ConfigurationError(
-                f"Invalid response-code set in slot {job.get('slot_id')}."
-            )
-        if set(code_to_option.values()) != set(canonical_options):
-            raise ConfigurationError(
-                f"Invalid code-to-option mapping in slot {job.get('slot_id')}."
-            )
-        if job_option_to_id != option_to_id:
-            raise ConfigurationError(
-                f"Canonical option mapping changed in slot {job.get('slot_id')}."
-            )
-        expected_code_to_id = {
-            code: option_to_id[option]
-            for code, option in code_to_option.items()
-        }
-        if code_to_id != expected_code_to_id:
-            raise ConfigurationError(
-                f"Code-to-canonical mapping is inconsistent in slot {job.get('slot_id')}."
-            )
-
-        if structure == RESPONSE_STRUCTURE_ORDERED:
-            if option_order != canonical_options:
-                raise ConfigurationError(
-                    f"Ordered response options were reordered in slot {job.get('slot_id')}."
-                )
-            if code_to_option != expected_ordered_mapping:
-                raise ConfigurationError(
-                    f"Ordered response-code mapping changed in slot {job.get('slot_id')}."
-                )
-
-
-def build_user_prompt(
-    config: Mapping[str, Any],
-    variant: Mapping[str, Any],
-    profile_values: Mapping[str, str],
-    option_order: Sequence[str],
-) -> tuple[str, dict[str, str]]:
-    canonical_options = list(config["answer_options"])
-    canonical_option_id_map(canonical_options)
-    if len(option_order) != len(canonical_options) or set(option_order) != set(canonical_options):
-        raise ConfigurationError(
-            "The prompt-facing option order must contain every canonical answer option exactly once."
-        )
-
-    codes = OPTION_CODES[: len(option_order)]
-    code_to_option = dict(zip(codes, option_order))
-
-    profile_lines = []
-    for dimension in config["demographic_dimensions"]:
-        prompt_label = DEMOGRAPHIC_DEFINITIONS[dimension]["prompt_label"]
-        profile_lines.append(f"- {prompt_label}: {profile_values[dimension]}")
-    profile_text = "\n".join(profile_lines) if profile_lines else "- No demographic profile supplied"
-
-    option_lines = "\n".join(f"{code}: {code_to_option[code]}" for code in codes)
-    allowed_codes = ", ".join(codes)
-
-    context_parts = [
-        f"Line of business: {config['line_of_business']}",
-        f"Customer journey type: {config['customer_journey_type']}",
-    ]
-    if config.get("context"):
-        context_parts.append(config["context"])
-    context_text = "\n".join(context_parts)
-
-    user_prompt = f"""You are a survey respondent with the following demographic profile:
-{profile_text}
-
-Read the situation below and answer exactly as this person would. Respond based on what this person would most likely do, not what they should do. Follow the response instructions precisely.
-
-SITUATION CONTEXT
-{context_text}
-
-TOUCHPOINT / INTERVENTION SHOWN TO YOU
---- BEGIN VARIANT ---
-{variant['text'].strip()}
---- END VARIANT ---
-
-QUESTION
-{config['outcome_question'].strip()}
-
-RESPONSE OPTIONS
-{option_lines}
-
-The response codes are technical labels used only to record your answer.
-Only return the response code corresponding to your answer from this list: {allowed_codes}. Return the code only, nothing else."""
-
-    return user_prompt, code_to_option
-
-
-def serialize_messages_for_tokenizer(system_prompt: str, user_prompt: str) -> str:
-    # The endpoint does not expose chat-template tokenization directly. Role
-    # markers make this closer to the actual chat request than plain concatenation.
-    return f"[SYSTEM]\n{system_prompt}\n\n[USER]\n{user_prompt}\n\n[ASSISTANT]\n"
-
-
-def build_simulation_plan(config: Mapping[str, Any], seed: int) -> list[dict[str, Any]]:
-    rng = random.Random(seed)
-    jobs: list[dict[str, Any]] = []
-    slot_number = 1
-    respondent_number = 1
-
-    canonical_options = list(config["answer_options"])
-    option_to_canonical_id = canonical_option_id_map(canonical_options)
-    response_option_structure = normalize_response_option_structure(
-        config.get("response_option_structure")
-    )
-
-    for variant_index, variant in enumerate(config["variants"]):
-        count = int(variant["count"])
-        variant_rng = random.Random(rng.getrandbits(64))
-
-        profiles = generate_profiles(
-            count=count,
-            dimensions=config["demographic_dimensions"],
-            distributions=config["demographic_distributions"],
-            rng=variant_rng,
-        )
-
-        option_orders = option_orders_for_structure(
-            canonical_options,
-            count,
-            variant_rng,
-            response_option_structure,
-        )
-
-        paired = list(zip(profiles, option_orders))
-        variant_rng.shuffle(paired)
-
-        for profile, option_order in paired:
-            user_prompt, code_to_option = build_user_prompt(
-                config=config,
-                variant=variant,
-                profile_values=profile["values"],
-                option_order=option_order,
-            )
-            code_to_canonical_id = {
-                code: option_to_canonical_id[option]
-                for code, option in code_to_option.items()
-            }
-
-            jobs.append(
-                {
-                    "slot_id": f"S{slot_number:05d}",
-                    "respondent_id": f"R{respondent_number:05d}",
-                    "slot_attempt": 1,
-                    "variant": variant["name"],
-                    "variant_index": variant_index,
-                    "profile_segments": profile["segments"],
-                    "profile_values": profile["values"],
-                    "response_option_structure": response_option_structure,
-                    "canonical_option_order": list(canonical_options),
-                    "option_to_canonical_id": dict(option_to_canonical_id),
-                    "option_order": list(option_order),
-                    "code_to_option": code_to_option,
-                    "code_to_canonical_id": code_to_canonical_id,
-                    "system_prompt": SYSTEM_PROMPT,
-                    "user_prompt": user_prompt,
-                }
-            )
-
-            slot_number += 1
-            respondent_number += 1
-
-    validate_plan_response_mappings(config, jobs)
-    rng.shuffle(jobs)
-    return jobs
 
 def normalize_model_answer(
     raw_text: str,
@@ -850,96 +631,6 @@ def run_one(
     }
 
 
-def _sample_jobs_by_variant(jobs: Sequence[Mapping[str, Any]], samples_per_variant: int = 3) -> dict[str, list[Mapping[str, Any]]]:
-    grouped: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
-    for job in jobs:
-        grouped[str(job["variant"])].append(job)
-
-    selected: dict[str, list[Mapping[str, Any]]] = {}
-    for variant, variant_jobs in grouped.items():
-        ordered = sorted(variant_jobs, key=lambda item: item["slot_id"])
-        if len(ordered) <= samples_per_variant:
-            selected[variant] = ordered
-            continue
-        indices = sorted({0, len(ordered) // 2, len(ordered) - 1})
-        selected[variant] = [ordered[index] for index in indices[:samples_per_variant]]
-    return selected
-
-
-def estimate_run(
-    api_key: str,
-    jobs: Sequence[Mapping[str, Any]],
-    runtime_info: Mapping[str, Any],
-) -> dict[str, Any]:
-    samples = _sample_jobs_by_variant(jobs)
-    condition_estimates: list[dict[str, Any]] = []
-    total_prompt_tokens = 0
-    used_fallback = False
-
-    variant_counts = Counter(str(job["variant"]) for job in jobs)
-    for variant, sample_jobs in samples.items():
-        token_counts: list[int] = []
-        sources: list[str] = []
-        for job in sample_jobs:
-            serialized = serialize_messages_for_tokenizer(job["system_prompt"], job["user_prompt"])
-            try:
-                count = tokenize_count(api_key, serialized)
-                source = "Featherless tokenizer"
-            except Exception:
-                count = heuristic_token_count(serialized)
-                source = "character-based fallback"
-                used_fallback = True
-            token_counts.append(count)
-            sources.append(source)
-
-        average_tokens = max(1, round(sum(token_counts) / len(token_counts)))
-        target_count = int(variant_counts[variant])
-        estimated_input = average_tokens * target_count
-        total_prompt_tokens += estimated_input
-        condition_estimates.append(
-            {
-                "variant": variant,
-                "sampled_prompts": len(sample_jobs),
-                "estimated_tokens_per_prompt": average_tokens,
-                "target_valid_n": target_count,
-                "estimated_input_tokens": estimated_input,
-                "token_source": (
-                    "character-based fallback"
-                    if "character-based fallback" in sources
-                    else "Featherless tokenizer"
-                ),
-            }
-        )
-
-    total_target = len(jobs)
-    estimated_completion_tokens = total_target * ESTIMATED_COMPLETION_TOKENS_PER_RESPONSE
-    safety_prompt_tokens = total_prompt_tokens * MAX_SLOT_ATTEMPTS
-    safety_completion_tokens = total_target * MAX_SLOT_ATTEMPTS * MAX_NEW_TOKENS
-
-    base_cost = None
-    safety_ceiling_cost = None
-    if runtime_info.get("pricing_available"):
-        base_cost = (
-            total_prompt_tokens * float(runtime_info["prompt_price"])
-            + estimated_completion_tokens * float(runtime_info["completion_price"])
-        )
-        safety_ceiling_cost = (
-            safety_prompt_tokens * float(runtime_info["prompt_price"])
-            + safety_completion_tokens * float(runtime_info["completion_price"])
-        )
-
-    return {
-        "prompt_tokens": total_prompt_tokens,
-        "completion_tokens": estimated_completion_tokens,
-        "safety_prompt_tokens": safety_prompt_tokens,
-        "safety_completion_tokens": safety_completion_tokens,
-        "base_cost": base_cost,
-        "safety_ceiling_cost": safety_ceiling_cost,
-        "used_fallback": used_fallback,
-        "condition_estimates": condition_estimates,
-    }
-
-
 def _selected_canonical_id(
     row: Mapping[str, Any],
     option_to_id: Mapping[str, str],
@@ -979,143 +670,6 @@ def _selected_canonical_id(
     return fallback_id
 
 
-def overall_result_rows(config: Mapping[str, Any], accepted_rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    target = config["target_behavior"]
-    control = config["control_variant"]
-    options = list(config["answer_options"])
-    option_to_id = canonical_option_id_map(options)
-    target_id = option_to_id[target]
-
-    by_variant: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
-    for row in accepted_rows:
-        by_variant[str(row["variant"])].append(row)
-
-    control_rows = by_variant.get(control, [])
-    control_n = len(control_rows)
-    control_target_count = sum(
-        _selected_canonical_id(row, option_to_id) == target_id
-        for row in control_rows
-    )
-    control_rate = control_target_count / control_n * 100 if control_n else None
-
-    output: list[dict[str, Any]] = []
-    for variant in config["variants"]:
-        name = variant["name"]
-        rows = by_variant.get(name, [])
-        valid_n = len(rows)
-        counts = Counter(_selected_canonical_id(row, option_to_id) for row in rows)
-        target_count = counts.get(target_id, 0)
-        target_rate = target_count / valid_n * 100 if valid_n else None
-        effect = None
-        if len(config["variants"]) > 1 and target_rate is not None and control_rate is not None:
-            effect = target_rate - control_rate
-
-        result: dict[str, Any] = {
-            "Variant": name,
-            "Control": name == control,
-            "Valid N": valid_n,
-            "Target N": int(variant["count"]),
-            "Target behavior": target,
-            "Target option ID": target_id,
-            "Target count": target_count,
-            "Target rate (%)": target_rate,
-            "Effect vs control (pp)": effect,
-        }
-        for option in options:
-            option_count = counts.get(option_to_id[option], 0)
-            result[f"{option} count"] = option_count
-            result[f"{option} rate (%)"] = option_count / valid_n * 100 if valid_n else None
-        output.append(result)
-    return output
-
-def segment_result_rows(config: Mapping[str, Any], accepted_rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    target = config["target_behavior"]
-    control = config["control_variant"]
-    variants = [variant["name"] for variant in config["variants"]]
-    options = list(config["answer_options"])
-    option_to_id = canonical_option_id_map(options)
-    target_id = option_to_id[target]
-    output: list[dict[str, Any]] = []
-
-    for dimension in config["demographic_dimensions"]:
-        segment_order = list(config["demographic_distributions"][dimension].keys())
-        for segment in segment_order:
-            segment_rows = [
-                row
-                for row in accepted_rows
-                if row.get("profile_segments", {}).get(dimension) == segment
-            ]
-            control_rows = [row for row in segment_rows if row["variant"] == control]
-            control_n = len(control_rows)
-            control_target_count = sum(
-                _selected_canonical_id(row, option_to_id) == target_id
-                for row in control_rows
-            )
-            control_rate = control_target_count / control_n * 100 if control_n else None
-
-            for variant in variants:
-                rows = [row for row in segment_rows if row["variant"] == variant]
-                valid_n = len(rows)
-                counts = Counter(_selected_canonical_id(row, option_to_id) for row in rows)
-                target_count = counts.get(target_id, 0)
-                target_rate = target_count / valid_n * 100 if valid_n else None
-                effect = None
-                if len(config["variants"]) > 1 and target_rate is not None and control_rate is not None:
-                    effect = target_rate - control_rate
-
-                result: dict[str, Any] = {
-                    "Demographic": dimension,
-                    "Segment": segment,
-                    "Variant": variant,
-                    "Control": variant == control,
-                    "Valid N": valid_n,
-                    "Target behavior": target,
-                    "Target option ID": target_id,
-                    "Target count": target_count,
-                    "Target rate (%)": target_rate,
-                    "Effect vs control (pp)": effect,
-                }
-                for option in options:
-                    count = counts.get(option_to_id[option], 0)
-                    result[f"{option} count"] = count
-                    result[f"{option} rate (%)"] = count / valid_n * 100 if valid_n else None
-                output.append(result)
-    return output
-
-def profile_balance_rows(
-    config: Mapping[str, Any],
-    planned_jobs: Sequence[Mapping[str, Any]],
-    accepted_rows: Sequence[Mapping[str, Any]],
-) -> list[dict[str, Any]]:
-    output: list[dict[str, Any]] = []
-    variants = [variant["name"] for variant in config["variants"]]
-    for dimension in config["demographic_dimensions"]:
-        for segment in config["demographic_distributions"][dimension].keys():
-            for variant in variants:
-                planned = sum(
-                    1
-                    for job in planned_jobs
-                    if job["variant"] == variant
-                    and job.get("profile_segments", {}).get(dimension) == segment
-                )
-                valid = sum(
-                    1
-                    for row in accepted_rows
-                    if row["variant"] == variant
-                    and row.get("profile_segments", {}).get(dimension) == segment
-                )
-                output.append(
-                    {
-                        "Demographic": dimension,
-                        "Segment": segment,
-                        "Variant": variant,
-                        "Planned N": planned,
-                        "Valid N": valid,
-                    }
-                )
-    return output
-
-
 def _excel_safe(value: Any) -> Any:
     if isinstance(value, (dict, list, tuple)):
         value = json.dumps(value, ensure_ascii=False)
@@ -1148,7 +702,7 @@ def _write_table(ws, start_row: int, headers: Sequence[str], rows: Sequence[Mapp
     thin_gray = Side(style="thin", color="39404C")
 
     for column, header in enumerate(headers, start=1):
-        cell = ws.cell(start_row, column, header)
+        cell = ws.cell(start_row, column, _excel_safe(header))
         cell.fill = accent_fill if column == 1 else header_fill
         cell.font = accent_font if column == 1 else header_font
         cell.alignment = Alignment(vertical="center", wrap_text=True)
@@ -1165,6 +719,424 @@ def _write_table(ws, start_row: int, headers: Sequence[str], rows: Sequence[Mapp
     return start_row + 1 + len(rows)
 
 
+def build_run_timestamp() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+# ---------------------------------------------------------------------------
+# Multi-question experiment planning. A respondent profile is generated once
+# and reused across all questions; each question randomises the assignment.
+# ---------------------------------------------------------------------------
+MAX_QUESTIONS = 5
+MAX_VARIANTS = 5
+
+
+def question_by_id(config: Mapping[str, Any], question_id: str) -> Mapping[str, Any]:
+    for question in config['questions']:
+        if question['id'] == question_id:
+            return question
+    raise ConfigurationError(f'Unknown question ID: {question_id}')
+
+
+def build_user_prompt(
+    config: Mapping[str, Any],
+    question: Mapping[str, Any],
+    variant: Mapping[str, Any],
+    profile_values: Mapping[str, str],
+    option_order: Sequence[str],
+) -> tuple[str, dict[str, str]]:
+    canonical = list(question['answer_options'])
+    canonical_option_id_map(canonical)
+    if len(option_order) != len(canonical) or set(option_order) != set(canonical):
+        raise ConfigurationError('Prompt options must contain every canonical option exactly once.')
+    codes = OPTION_CODES[:len(canonical)]
+    code_to_option = dict(zip(codes, option_order))
+    profile_lines = [
+        f"- {DEMOGRAPHIC_DEFINITIONS[d]['prompt_label']}: {profile_values[d]}"
+        for d in config['demographic_dimensions']
+    ]
+    profile_text = '\n'.join(profile_lines) if profile_lines else '- Not specified'
+    context = config['context'].strip()
+    if not context:
+        raise ConfigurationError('Experiment context is required.')
+
+    intervention = str(variant.get('text') or '').strip()
+    stimulus_section = (
+        f'\nTOUCHPOINT / INTERVENTION SHOWN TO YOU\n'
+        f'--- BEGIN VARIANT ---\n{intervention}\n--- END VARIANT ---\n'
+        if intervention else ''
+    )
+    option_lines = '\n'.join(f'{code}: {code_to_option[code]}' for code in codes)
+    allowed_codes = ', '.join(codes)
+    prompt = f"""You are a survey respondent with the following demographic profile:
+{profile_text}
+
+Read the situation below and answer the question as this person most likely would.
+Use their likely perspective rather than a socially desirable or ideal response.
+Follow the response instructions precisely.
+
+SITUATION CONTEXT
+{context}
+{stimulus_section}
+QUESTION
+{question['outcome_question'].strip()}
+
+RESPONSE OPTIONS
+{option_lines}
+
+The response codes are technical labels used only to record your answer.
+Only return the response code corresponding to your answer from this list: {allowed_codes}.
+Return the code only, nothing else."""
+    return prompt, code_to_option
+
+
+def _balanced_variant_assignments(
+    profiles: Sequence[Mapping[str, Any]],
+    variants: Sequence[Mapping[str, Any]],
+    dimensions: Sequence[str],
+    distributions: Mapping[str, Mapping[str, float]],
+    rng: random.Random,
+) -> dict[int, int]:
+    """Randomised, quota-aware assignment with exact variant sample sizes.
+
+    The common sample's marginal demographics are exact (within rounding).
+    We attempt to balance all dimensions within each arm, but their joint
+    distributions need not permit simultaneous exact quota satisfaction.
+    """
+    counts = [int(v['count']) for v in variants]
+    if sum(counts) != len(profiles) or any(c <= 0 for c in counts):
+        raise ConfigurationError('Per-question variant counts must sum to the respondent count.')
+    targets: list[dict[str, dict[str, int]]] = []
+    for size in counts:
+        dimension_targets = {}
+        for dimension in dimensions:
+            category_shares = distributions[dimension]
+            category_names = list(category_shares)
+            expected_counts = largest_remainder_counts(size, list(category_shares.values()))
+            dimension_targets[dimension] = dict(zip(category_names, expected_counts))
+        targets.append(dimension_targets)
+
+    used = [{dimension: Counter() for dimension in dimensions} for _ in variants]
+    remaining = list(counts)
+    order = list(range(len(profiles)))
+    rng.shuffle(order)
+    allocation: dict[int, int] = {}
+    for profile_index in order:
+        segment_values = profiles[profile_index]['segments']
+        choices = [index for index, capacity in enumerate(remaining) if capacity > 0]
+        if not choices:
+            raise ConfigurationError('No variant capacity available.')
+        best_index = None
+        best_score = float('-inf')
+        for variant_index in choices:
+            score = sum(
+                targets[variant_index][dimension].get(segment_values[dimension], 0)
+                - used[variant_index][dimension][segment_values[dimension]]
+                for dimension in dimensions
+            )
+            # Break ties randomly; the seeded PRNG makes the plan reproducible.
+            score += rng.random() * 0.25
+            if score > best_score:
+                best_index = variant_index
+                best_score = score
+        assert best_index is not None
+        allocation[profile_index] = best_index
+        remaining[best_index] -= 1
+        for dimension in dimensions:
+            used[best_index][dimension][segment_values[dimension]] += 1
+    return allocation
+
+
+def build_simulation_plan(config: Mapping[str, Any], seed: int) -> list[dict[str, Any]]:
+    questions = config['questions']
+    if not 1 <= len(questions) <= MAX_QUESTIONS:
+        raise ConfigurationError(f'Choose 1 to {MAX_QUESTIONS} survey questions.')
+    n = int(config['total_simulations'])
+    if not 1 <= n <= MAX_SIMULATIONS:
+        raise ConfigurationError(f'Respondents per question must be 1 to {MAX_SIMULATIONS:,}.')
+    rng = random.Random(seed)
+    profiles = generate_profiles(
+        n, config['demographic_dimensions'], config['demographic_distributions'], rng
+    )
+    jobs: list[dict[str, Any]] = []
+    for question in questions:
+        qid = str(question['id'])
+        variants = question['variants']
+        if not 1 <= len(variants) <= MAX_VARIANTS:
+            raise ConfigurationError(f'{qid} must have between 1 and {MAX_VARIANTS} arms.')
+        question_rng = random.Random(rng.getrandbits(64))
+        assigned = _balanced_variant_assignments(
+            profiles, variants, config['demographic_dimensions'],
+            config['demographic_distributions'], question_rng,
+        )
+        canonical = list(question['answer_options'])
+        option_to_id = canonical_option_id_map(canonical)
+        structure = normalize_response_option_structure(question['response_option_structure'])
+        for variant_index, variant in enumerate(variants):
+            assigned_ids = [idx for idx, arm in assigned.items() if arm == variant_index]
+            question_rng.shuffle(assigned_ids)
+            orders = option_orders_for_structure(
+                canonical, len(assigned_ids), question_rng, structure
+            )
+            for respondent_index, order in zip(assigned_ids, orders):
+                respondent_id = f'R{respondent_index + 1:05d}'
+                profile = profiles[respondent_index]
+                user_prompt, code_to_option = build_user_prompt(
+                    config, question, variant, profile['values'], order
+                )
+                jobs.append({
+                    'slot_id': f'{qid}-{respondent_id}',
+                    'respondent_id': respondent_id,
+                    'question_id': qid,
+                    'question_name': question['name'],
+                    'slot_attempt': 1,
+                    'variant': variant['name'],
+                    'variant_index': variant_index,
+                    'profile_segments': dict(profile['segments']),
+                    'profile_values': dict(profile['values']),
+                    'response_option_structure': structure,
+                    'canonical_option_order': list(canonical),
+                    'option_to_canonical_id': dict(option_to_id),
+                    'option_order': list(order),
+                    'code_to_option': code_to_option,
+                    'code_to_canonical_id': {
+                        code: option_to_id[option] for code, option in code_to_option.items()
+                    },
+                    'system_prompt': SYSTEM_PROMPT,
+                    'user_prompt': user_prompt,
+                })
+    validate_plan_response_mappings(config, jobs)
+    rng.shuffle(jobs)
+    return jobs
+
+
+def validate_plan_response_mappings(
+    config: Mapping[str, Any], jobs: Sequence[Mapping[str, Any]]
+) -> None:
+    if len(jobs) != int(config['total_simulations']) * len(config['questions']):
+        raise ConfigurationError('Unexpected number of planned jobs.')
+    questions = {q['id']: q for q in config['questions']}
+    respondent_profiles: dict[str, tuple[dict, dict]] = {}
+    seen = set()
+    arm_counts = Counter()
+    for job in jobs:
+        qid = job['question_id']
+        if qid not in questions:
+            raise ConfigurationError(f'Unexpected question ID: {qid}')
+        question = questions[qid]
+        response_options = list(question['answer_options'])
+        codes = OPTION_CODES[:len(response_options)]
+        canonical_ids = canonical_option_id_map(response_options)
+        order = list(job['option_order'])
+        mapping = dict(job['code_to_option'])
+        if len(order) != len(response_options) or set(order) != set(response_options):
+            raise ConfigurationError(f'{job["slot_id"]}: response options were corrupted.')
+        if list(mapping) != list(codes) or list(mapping.values()) != order:
+            raise ConfigurationError(f'{job["slot_id"]}: response-code mapping is inconsistent.')
+        if job['option_to_canonical_id'] != canonical_ids or job['code_to_canonical_id'] != {
+            code: canonical_ids[option] for code, option in mapping.items()
+        }:
+            raise ConfigurationError(f'{job["slot_id"]}: canonical IDs were corrupted.')
+        if question['response_option_structure'] == RESPONSE_STRUCTURE_ORDERED:
+            if order != response_options:
+                raise ConfigurationError(f'{job["slot_id"]}: Likert order was changed.')
+        identity = (qid, job['respondent_id'])
+        if identity in seen:
+            raise ConfigurationError(f'Duplicate respondent/question pair: {identity}')
+        seen.add(identity)
+        profile = (job['profile_segments'], job['profile_values'])
+        prior_profile = respondent_profiles.setdefault(job['respondent_id'], profile)
+        if prior_profile != profile:
+            raise ConfigurationError('A respondent profile changed across questions.')
+        arm_counts[(qid, job['variant'])] += 1
+    if len(respondent_profiles) != int(config['total_simulations']):
+        raise ConfigurationError('The shared respondent pool has the wrong size.')
+    for question in config['questions']:
+        for variant in question['variants']:
+            if arm_counts[(question['id'], variant['name'])] != int(variant['count']):
+                raise ConfigurationError('Variant allocations differ from the requested counts.')
+
+
+def _median_ordinal(counts: Counter, option_ids: Sequence[str], n: int) -> float | None:
+    if not n:
+        return None
+    positions = ((n - 1) // 2, n // 2)
+    median_ranks = []
+    cursor = 0
+    for rank, oid in enumerate(option_ids, start=1):
+        next_cursor = cursor + counts.get(oid, 0)
+        for position in positions:
+            if cursor <= position < next_cursor:
+                median_ranks.append(rank)
+        cursor = next_cursor
+    return sum(median_ranks) / 2 if len(median_ranks) == 2 else None
+
+
+def _summarize_response_group(
+    question: Mapping[str, Any], rows: Sequence[Mapping[str, Any]],
+    control_target_rate: float | None = None,
+) -> dict[str, Any]:
+    options = question['answer_options']
+    option_to_id = canonical_option_id_map(options)
+    counts = Counter(_selected_canonical_id(row, option_to_id) for row in rows)
+    n = len(rows)
+    target = question.get('target_behavior') or None
+    target_id = option_to_id[target] if target else None
+    target_count = counts.get(target_id, 0) if target_id else None
+    target_rate = (target_count / n * 100) if n and target_id else None
+    effect = (
+        target_rate - control_target_rate
+        if target_rate is not None and control_target_rate is not None
+        else None
+    )
+    result: dict[str, Any] = {
+        'Valid N': n,
+        'Target behavior': target,
+        'Target count': target_count,
+        'Target rate (%)': target_rate,
+        'Effect vs control (pp)': effect,
+    }
+    for option in options:
+        count = counts.get(option_to_id[option], 0)
+        result[f'{option} count'] = count
+        result[f'{option} rate (%)'] = count / n * 100 if n else None
+    if question['response_option_structure'] == RESPONSE_STRUCTURE_ORDERED:
+        option_ids = [option_to_id[option] for option in options]
+        result['Mean ordinal score'] = (
+            sum(rank * counts.get(oid, 0) for rank, oid in enumerate(option_ids, start=1)) / n
+            if n else None
+        )
+        result['Median ordinal score'] = _median_ordinal(counts, option_ids, n)
+    return result
+
+
+def overall_result_rows(
+    question: Mapping[str, Any], accepted_rows: Sequence[Mapping[str, Any]]
+) -> list[dict[str, Any]]:
+    qid = question['id']
+    rows_by_variant: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    for row in accepted_rows:
+        if row['question_id'] == qid:
+            rows_by_variant[str(row['variant'])].append(row)
+    control = question.get('control_variant') or None
+    target = question.get('target_behavior') or None
+    control_rate = None
+    if target and control:
+        control_stats = _summarize_response_group(question, rows_by_variant.get(control, []))
+        control_rate = control_stats['Target rate (%)']
+    output = []
+    for variant in question['variants']:
+        name = variant['name']
+        stats = _summarize_response_group(question, rows_by_variant.get(name, []), control_rate)
+        output.append({
+            'Question ID': qid,
+            'Question': question['name'],
+            'Variant': name,
+            'Control': name == control if control else False,
+            'Target N': int(variant['count']),
+            **stats,
+        })
+    return output
+
+
+def segment_result_rows(
+    config: Mapping[str, Any], question: Mapping[str, Any],
+    accepted_rows: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    qid = question['id']
+    qrows = [row for row in accepted_rows if row['question_id'] == qid]
+    control = question.get('control_variant') or None
+    target = question.get('target_behavior') or None
+    output = []
+    for dimension in config['demographic_dimensions']:
+        for segment in config['demographic_distributions'][dimension]:
+            segment_rows = [
+                row for row in qrows
+                if row.get('profile_segments', {}).get(dimension) == segment
+            ]
+            by_variant = defaultdict(list)
+            for row in segment_rows:
+                by_variant[row['variant']].append(row)
+            control_rate = None
+            if target and control:
+                control_stats = _summarize_response_group(
+                    question, by_variant.get(control, [])
+                )
+                control_rate = control_stats['Target rate (%)']
+            for variant in question['variants']:
+                name = variant['name']
+                stats = _summarize_response_group(
+                    question, by_variant.get(name, []), control_rate
+                )
+                output.append({
+                    'Question ID': qid,
+                    'Question': question['name'],
+                    'Demographic': dimension,
+                    'Segment': segment,
+                    'Variant': name,
+                    'Control': name == control if control else False,
+                    **stats,
+                })
+    return output
+
+
+def profile_balance_rows(
+    config: Mapping[str, Any], question: Mapping[str, Any],
+    planned_jobs: Sequence[Mapping[str, Any]],
+    accepted_rows: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    qid = question['id']
+    output = []
+    planned_counts = Counter(
+        (job['variant'], dimension, job['profile_segments'].get(dimension))
+        for job in planned_jobs if job['question_id'] == qid
+        for dimension in config['demographic_dimensions']
+    )
+    accepted_counts = Counter(
+        (row['variant'], dimension, row.get('profile_segments', {}).get(dimension))
+        for row in accepted_rows if row['question_id'] == qid
+        for dimension in config['demographic_dimensions']
+    )
+    for dimension in config['demographic_dimensions']:
+        for segment in config['demographic_distributions'][dimension]:
+            for variant in question['variants']:
+                key = (variant['name'], dimension, segment)
+                output.append({
+                    'Question ID': qid,
+                    'Question': question['name'],
+                    'Demographic': dimension,
+                    'Segment': segment,
+                    'Variant': variant['name'],
+                    'Planned N': planned_counts[key],
+                    'Valid N': accepted_counts[key],
+                })
+    return output
+
+
+def compact_attempt(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Do not duplicate the full prompt thousands of times in run history."""
+    keys = (
+        'attempt_id', 'slot_id', 'respondent_id', 'question_id', 'question_name',
+        'slot_attempt', 'variant', 'variant_index', 'profile_segments',
+        'profile_values', 'response_option_structure', 'canonical_option_order',
+        'option_order', 'code_to_option', 'code_to_canonical_id',
+        'selected_code', 'selected_option', 'selected_option_id',
+        'raw_completion', 'status', 'error', 'prompt_tokens', 'completion_tokens',
+        'cost', 'http_attempts', 'retry_events', 'finish_reason',
+    )
+    return {key: row.get(key) for key in keys}
+
+
+
+def _union_headers(rows: Sequence[Mapping[str, Any]]) -> list[str]:
+    headers: list[str] = []
+    seen = set()
+    for row in rows:
+        for header in row:
+            if header not in seen:
+                headers.append(header)
+                seen.add(header)
+    return headers
+
 def create_excel_export(
     config: Mapping[str, Any],
     planned_jobs: Sequence[Mapping[str, Any]],
@@ -1172,205 +1144,209 @@ def create_excel_export(
 ) -> bytes:
     wb = Workbook()
     ws = wb.active
-    ws.title = "Setup"
-
-    dark_fill = PatternFill("solid", fgColor="171B23")
-    accent_fill = PatternFill("solid", fgColor="00FF9B")
-    white_font = Font(color="F3F4F6", bold=True)
-    black_bold = Font(color="000000", bold=True)
-    section_font = Font(color="000000", bold=True, size=12)
+    ws.title = 'Setup'
+    dark = PatternFill('solid', fgColor='171B23')
+    accent = PatternFill('solid', fgColor='00FF9B')
+    label_font = Font(color='F3F4F6', bold=True)
+    title_font = Font(color='000000', bold=True, size=12)
 
     def section(title: str, row: int) -> int:
         ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=4)
         cell = ws.cell(row, 1, title)
-        cell.fill = accent_fill
-        cell.font = section_font
+        cell.fill = accent
+        cell.font = title_font
         return row + 1
 
     def key_value(label: str, value: Any, row: int) -> int:
         label_cell = ws.cell(row, 1, label)
-        label_cell.fill = dark_fill
-        label_cell.font = white_font
+        label_cell.fill = dark
+        label_cell.font = label_font
         value_cell = ws.cell(row, 2, _excel_safe(value))
-        value_cell.alignment = Alignment(wrap_text=True, vertical="top")
+        value_cell.alignment = Alignment(wrap_text=True, vertical='top')
         ws.merge_cells(start_row=row, start_column=2, end_row=row, end_column=4)
         return row + 1
 
-    row = 1
-    row = section("Run metadata", row)
-    row = key_value("Experiment name", config["experiment_name"], row)
-    row = key_value("Run timestamp (UTC)", run_data.get("run_timestamp"), row)
-    row = key_value("Model", MODEL_ID, row)
-    row = key_value("Plan seed", config.get("plan_seed"), row)
-    row = key_value("Total target valid N", config["total_simulations"], row)
-    row = key_value("Control variant", config["control_variant"], row)
-    row = key_value("Representative U.S. preset", config["use_us_preset"], row)
-    row = key_value("Preset note", US_PRESET_NOTE if config["use_us_preset"] else "Custom marginal distributions", row)
-    row += 1
-
-    row = section("Experiment context", row)
-    row = key_value("Line of business", config["line_of_business"], row)
-    row = key_value("Customer journey type", config["customer_journey_type"], row)
-    row = key_value("Additional context", config["context"], row)
-    row += 1
-
-    row = section("Outcome", row)
-    row = key_value("Outcome question", config["outcome_question"], row)
-    row = key_value("Answer options", "\n".join(config["answer_options"]), row)
-    row = key_value(
-        "Response option structure",
-        config.get("response_option_structure", "Categorical / unordered"),
-        row,
-    )
-    row = key_value("Target behavior", config["target_behavior"], row)
-    row += 1
-
-    row = section("Model and sampling settings", row)
-    row = key_value("Temperature", config["settings"]["temperature"], row)
-    row = key_value("Top-p", config["settings"]["top_p"], row)
-    row = key_value("Top-k", config["settings"]["top_k"] if config["settings"]["use_top_k"] else "Disabled", row)
-    row = key_value("Max generated tokens", MAX_NEW_TOKENS, row)
-    row = key_value("Max slot attempts", MAX_SLOT_ATTEMPTS, row)
-    row = key_value("Variant assignment", "Exact requested allocation; jobs randomly interleaved", row)
-    row = key_value("Demographic balancing", "Marginal quotas reproduced separately within each variant", row)
-    response_structure = normalize_response_option_structure(
-        config.get("response_option_structure")
-    )
-    if response_structure == RESPONSE_STRUCTURE_ORDERED:
-        response_order_note = (
-            "Ordered/Likert: entered option order and code-to-option mapping are fixed "
-            "for every simulated respondent."
-        )
-    else:
-        response_order_note = (
-            "Categorical: prompt-facing code-to-option mappings are cyclically "
-            "counterbalanced; every response is decoded to a fixed canonical option ID "
-            "before analysis."
-        )
-    row = key_value("Response-order control", response_order_note, row)
-    row = key_value(
-        "Canonical option IDs",
-        canonical_option_id_map(config["answer_options"]),
-        row,
-    )
-    row += 1
-
-    row = section("Variants", row)
-    variant_headers = ["Variant", "Allocation (%)", "Target N", "Control", "Content"]
-    variant_rows = [
-        {
-            "Variant": variant["name"],
-            "Allocation (%)": variant["allocation"],
-            "Target N": variant["count"],
-            "Control": variant["name"] == config["control_variant"],
-            "Content": variant["text"],
-        }
-        for variant in config["variants"]
+    row = section('Experiment and run metadata', 1)
+    metadata = [
+        ('Experiment name', config['experiment_name']),
+        ('Run timestamp (UTC)', run_data.get('run_timestamp')),
+        ('Model', MODEL_ID),
+        ('Plan seed', config.get('plan_seed')),
+        ('Number of questions', len(config['questions'])),
+        ('Valid respondent target per question', config['total_simulations']),
+        ('Total target responses', len(config['questions']) * config['total_simulations']),
+        ('Experiment context', config['context']),
+        ('Representative US preset', config['use_us_preset']),
+        ('Demographic preset note', US_PRESET_NOTE if config['use_us_preset'] else 'Custom marginal distributions'),
     ]
-    row = _write_table(ws, row, variant_headers, variant_rows) + 1
-
-    row = section("Demographic marginal distributions", row)
-    demographic_rows = []
-    for dimension in config["demographic_dimensions"]:
-        for category, percentage in config["demographic_distributions"][dimension].items():
-            demographic_rows.append(
-                {"Demographic": dimension, "Category": category, "Percentage": percentage}
-            )
-    row = _write_table(ws, row, ["Demographic", "Category", "Percentage"], demographic_rows) + 1
-
-    row = section("Run quality and usage", row)
-    quality_pairs = [
-        ("Valid responses", run_data.get("valid_total")),
-        ("Target responses", run_data.get("total_target")),
-        ("Invalid model outputs", run_data.get("invalid_outputs")),
-        ("API-failed slot attempts", run_data.get("api_failed_attempts")),
-        ("Temporary API retry events", run_data.get("retry_events")),
-        ("Simulation attempts", run_data.get("simulation_attempts")),
-        ("Underlying HTTP requests", run_data.get("http_requests")),
-        ("Input tokens", run_data.get("input_tokens")),
-        ("Output tokens", run_data.get("output_tokens")),
-        ("Calculated API cost", run_data.get("actual_cost")),
-    ]
-    for label, value in quality_pairs:
+    for label, value in metadata:
         row = key_value(label, value, row)
-
-    ws.column_dimensions["A"].width = 32
-    ws.column_dimensions["B"].width = 35
-    ws.column_dimensions["C"].width = 24
-    ws.column_dimensions["D"].width = 90
+    row += 1
+    row = section('Model and sampling settings', row)
+    for label, value in [
+        ('Temperature', config['settings']['temperature']),
+        ('Top-p', config['settings']['top_p']),
+        ('Top-k', config['settings']['top_k'] if config['settings']['use_top_k'] else 'Disabled'),
+        ('Maximum generated tokens', MAX_NEW_TOKENS),
+        ('Maximum attempts per response slot', MAX_SLOT_ATTEMPTS),
+        ('Respondent profile reuse', 'Same respondent profile across all questions'),
+        ('Intervention assignment', 'Independently randomised per question; exact arm Ns'),
+        ('Demographic balancing', 'Exact overall marginals; approximate within-arm balancing'),
+        ('Categorical responses', 'Counterbalanced codes decoded to fixed canonical IDs'),
+        ('Ordered responses', 'Fixed answer order and code mappings'),
+    ]:
+        row = key_value(label, value, row)
+    row += 1
+    row = section('Demographic marginal distributions', row)
+    demographics = [
+        {'Dimension': dimension, 'Category': category, 'Share (%)': share}
+        for dimension in config['demographic_dimensions']
+        for category, share in config['demographic_distributions'][dimension].items()
+    ]
+    row = _write_table(ws, row, ['Dimension', 'Category', 'Share (%)'], demographics) + 1
+    row = section('Run quality and actual usage', row)
+    for label, key in [
+        ('Valid responses', 'valid_total'), ('Requested responses', 'total_target'),
+        ('Invalid outputs', 'invalid_outputs'), ('API-failed attempts', 'api_failed_attempts'),
+        ('Temporary API retries', 'retry_events'), ('Simulation attempts', 'simulation_attempts'),
+        ('Underlying HTTP requests', 'http_requests'), ('Input tokens', 'input_tokens'),
+        ('Output tokens', 'output_tokens'), ('Calculated API cost', 'actual_cost'),
+    ]:
+        row = key_value(label, run_data.get(key), row)
+    ws.column_dimensions['A'].width = 38
+    ws.column_dimensions['B'].width = 45
+    ws.column_dimensions['C'].width = 26
+    ws.column_dimensions['D'].width = 76
     ws.sheet_view.showGridLines = False
 
-    overall = wb.create_sheet("Overall Results")
-    overall_rows = overall_result_rows(config, run_data["accepted_rows"])
-    overall_headers = list(overall_rows[0].keys()) if overall_rows else ["Variant"]
-    _write_table(overall, 1, overall_headers, overall_rows)
-    _format_worksheet(overall, "A2")
+    setup = wb.create_sheet('Question Setup')
+    question_setup = [
+        {
+            'Question ID': q['id'], 'Question name': q['name'],
+            'Survey question': q['outcome_question'],
+            'Intervention used': q['has_intervention'],
+            'Variant': v['name'], 'Intervention text': v['text'],
+            'Allocation (%)': v['allocation'], 'Target N': v['count'],
+            'Response structure': q['response_option_structure'],
+            'Answer options': '\n'.join(q['answer_options']),
+            'Canonical IDs': canonical_option_id_map(q['answer_options']),
+            'Target behavior': q.get('target_behavior'),
+            'Control variant': q.get('control_variant'),
+        }
+        for q in config['questions'] for v in q['variants']
+    ]
+    _write_table(setup, 1, list(question_setup[0]), question_setup)
+    _format_worksheet(setup, 'A2')
+    setup.auto_filter.ref = setup.dimensions
+
+    overall = wb.create_sheet('Overall Results')
+    overall_rows = [
+        record for question in config['questions']
+        for record in overall_result_rows(question, run_data['accepted_rows'])
+    ]
+    _write_table(overall, 1, _union_headers(overall_rows), overall_rows)
+    _format_worksheet(overall, 'A2')
     overall.auto_filter.ref = overall.dimensions
 
-    segments = wb.create_sheet("Segment Results")
-    segment_rows = segment_result_rows(config, run_data["accepted_rows"])
-    segment_headers = list(segment_rows[0].keys()) if segment_rows else ["Demographic"]
-    _write_table(segments, 1, segment_headers, segment_rows)
-    _format_worksheet(segments, "A2")
+    segments = wb.create_sheet('Segment Results')
+    segment_rows = [
+        record for question in config['questions']
+        for record in segment_result_rows(config, question, run_data['accepted_rows'])
+    ]
+    _write_table(segments, 1, _union_headers(segment_rows) if segment_rows else ['Question ID'], segment_rows)
+    _format_worksheet(segments, 'A2')
     segments.auto_filter.ref = segments.dimensions
 
-    balance = wb.create_sheet("Profile Balance")
-    balance_rows = profile_balance_rows(config, planned_jobs, run_data["accepted_rows"])
-    balance_headers = list(balance_rows[0].keys()) if balance_rows else ["Demographic"]
-    _write_table(balance, 1, balance_headers, balance_rows)
-    _format_worksheet(balance, "A2")
+    balance = wb.create_sheet('Profile Balance')
+    balance_rows = [
+        record for question in config['questions']
+        for record in profile_balance_rows(config, question, planned_jobs, run_data['accepted_rows'])
+    ]
+    _write_table(balance, 1, _union_headers(balance_rows) if balance_rows else ['Question ID'], balance_rows)
+    _format_worksheet(balance, 'A2')
     balance.auto_filter.ref = balance.dimensions
 
-    raw = wb.create_sheet("Raw Simulations")
-    raw_rows: list[dict[str, Any]] = []
-    for result in run_data["rows"]:
-        row_data: dict[str, Any] = {
-            "Attempt ID": result.get("attempt_id"),
-            "Slot ID": result.get("slot_id"),
-            "Respondent ID": result.get("respondent_id"),
-            "Slot attempt": result.get("slot_attempt"),
-            "Variant": result.get("variant"),
-            "Status": result.get("status"),
-            "Selected code": result.get("selected_code"),
-            "Selected option": result.get("selected_option"),
-            "Selected canonical option ID": result.get("selected_option_id"),
-            "Raw completion": result.get("raw_completion"),
-            "Error": result.get("error"),
-            "Canonical option order": result.get("canonical_option_order"),
-            "Option-to-canonical-ID mapping": result.get("option_to_canonical_id"),
-            "Prompt option order": result.get("option_order"),
-            "Code-to-option mapping": result.get("code_to_option"),
-            "Code-to-canonical-ID mapping": result.get("code_to_canonical_id"),
-            "Prompt tokens": result.get("prompt_tokens"),
-            "Completion tokens": result.get("completion_tokens"),
-            "Cost": result.get("cost"),
-            "HTTP attempts": result.get("http_attempts"),
-            "Temporary retries": result.get("retry_events"),
-            "Finish reason": result.get("finish_reason"),
+    full_distribution = wb.create_sheet('Overall Distributions')
+    distribution_rows = [
+        {
+            'Question ID': question['id'], 'Question': question['name'],
+            'Variant': row['Variant'], 'Response option': option,
+            'Option position': index, 'Response count': row[f'{option} count'],
+            'Response share (%)': row[f'{option} rate (%)'],
+            'Valid N': row['Valid N'],
         }
-        for dimension in config["demographic_dimensions"]:
-            row_data[f"{dimension} segment"] = result.get("profile_segments", {}).get(dimension)
-            row_data[f"{dimension} prompt value"] = result.get("profile_values", {}).get(dimension)
-        raw_rows.append(row_data)
+        for question in config['questions']
+        for row in overall_result_rows(question, run_data['accepted_rows'])
+        for index, option in enumerate(question['answer_options'], start=1)
+    ]
+    _write_table(full_distribution, 1, list(distribution_rows[0]), distribution_rows)
+    _format_worksheet(full_distribution, 'A2')
+    full_distribution.auto_filter.ref = full_distribution.dimensions
 
-    raw_headers = list(raw_rows[0].keys()) if raw_rows else ["Attempt ID"]
-    _write_table(raw, 1, raw_headers, raw_rows)
-    _format_worksheet(raw, "A2")
+    segmented_distribution = wb.create_sheet('Segment Distributions')
+    segment_distribution_rows = [
+        {
+            'Question ID': question['id'], 'Question': question['name'],
+            'Demographic': row['Demographic'], 'Segment': row['Segment'],
+            'Variant': row['Variant'], 'Response option': option,
+            'Option position': index, 'Response count': row[f'{option} count'],
+            'Response share (%)': row[f'{option} rate (%)'],
+            'Valid N': row['Valid N'],
+        }
+        for question in config['questions']
+        for row in segment_result_rows(config, question, run_data['accepted_rows'])
+        for index, option in enumerate(question['answer_options'], start=1)
+    ]
+    _write_table(segmented_distribution, 1,
+                 list(segment_distribution_rows[0]) if segment_distribution_rows else ['Question ID'],
+                 segment_distribution_rows)
+    _format_worksheet(segmented_distribution, 'A2')
+    segmented_distribution.auto_filter.ref = segmented_distribution.dimensions
+
+    raw = wb.create_sheet('Raw Simulations')
+    raw_rows = []
+    for result in run_data['rows']:
+        data = {
+            'Attempt ID': result.get('attempt_id'),
+            'Slot ID': result.get('slot_id'),
+            'Respondent ID': result.get('respondent_id'),
+            'Question ID': result.get('question_id'),
+            'Question': result.get('question_name'),
+            'Variant': result.get('variant'),
+            'Slot attempt': result.get('slot_attempt'),
+            'Status': result.get('status'),
+            'Selected response code': result.get('selected_code'),
+            'Selected response text': result.get('selected_option'),
+            'Canonical option ID': result.get('selected_option_id'),
+            'Raw model completion': result.get('raw_completion'),
+            'Error': result.get('error'),
+            'Prompt option order': result.get('option_order'),
+            'Code-to-option map': result.get('code_to_option'),
+            'Prompt tokens': result.get('prompt_tokens'),
+            'Completion tokens': result.get('completion_tokens'),
+            'Cost': result.get('cost'),
+            'HTTP attempts': result.get('http_attempts'),
+            'Temporary retries': result.get('retry_events'),
+            'Finish reason': result.get('finish_reason'),
+        }
+        for dimension in config['demographic_dimensions']:
+            data[f'{dimension} segment'] = (result.get('profile_segments') or {}).get(dimension)
+            data[f'{dimension} prompt value'] = (result.get('profile_values') or {}).get(dimension)
+        raw_rows.append(data)
+    _write_table(raw, 1, list(raw_rows[0]) if raw_rows else ['Attempt ID'], raw_rows)
+    _format_worksheet(raw, 'A2')
     raw.auto_filter.ref = raw.dimensions
 
-    sources = wb.create_sheet("Sources and Notes")
+    sources = wb.create_sheet('Sources and Notes')
     source_rows = [
-        {"Type": "Model card", "Source": "https://huggingface.co/socratesft/socrates-qwen2.5-14b-sft"},
-        {"Type": "Socrates paper", "Source": "https://arxiv.org/abs/2509.05830"},
-        {"Type": "Preset note", "Source": US_PRESET_NOTE},
-    ] + [{"Type": "U.S. preset source", "Source": source} for source in US_PRESET_SOURCES]
-    _write_table(sources, 1, ["Type", "Source"], source_rows)
-    _format_worksheet(sources, "A2")
+        {'Type': 'Model card', 'Source': 'https://huggingface.co/socratesft/socrates-qwen2.5-14b-sft'},
+        {'Type': 'Socrates paper', 'Source': 'https://arxiv.org/abs/2509.05830'},
+        {'Type': 'Caveat', 'Source': 'Synthetic model responses are not human participants or causal field evidence.'},
+        {'Type': 'Preset caveat', 'Source': US_PRESET_NOTE},
+    ] + [{'Type': 'US preset source', 'Source': source} for source in US_PRESET_SOURCES]
+    _write_table(sources, 1, ['Type', 'Source'], source_rows)
+    _format_worksheet(sources, 'A2')
 
-    buffer = io.BytesIO()
-    wb.save(buffer)
-    return buffer.getvalue()
-
-
-def build_run_timestamp() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    output = io.BytesIO()
+    wb.save(output)
+    return output.getvalue()
